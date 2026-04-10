@@ -817,12 +817,15 @@ export function CompanySkills() {
   const updateStatusQuery = useQuery({
     queryKey: queryKeys.companySkills.updateStatus(selectedCompanyId ?? "", selectedSkillId ?? ""),
     queryFn: () => companySkillsApi.updateStatus(selectedCompanyId!, selectedSkillId!),
-    enabled: Boolean(
-      selectedCompanyId
-      && selectedSkillId
-      && (detailQuery.data?.sourceType === "github" || displayedDetail?.sourceType === "github"),
-    ),
-    staleTime: 60_000,
+    // Disabled auto-fetch: update status involves an outbound GitHub API call
+    // that slows down skill page loads. Users can still check via the "Check for updates" button.
+    // enabled: Boolean(
+    //   selectedCompanyId
+    //   && selectedSkillId
+    //   && (detailQuery.data?.sourceType === "github" || displayedDetail?.sourceType === "github"),
+    // ),
+    // staleTime: 60_000,
+    enabled: false,
   });
 
   useEffect(() => {
