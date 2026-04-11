@@ -27,13 +27,13 @@ import type {
   CompanySkillUsageAgent,
 } from "@paperclipai/shared";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
-import { findActiveServerAdapter } from "../adapters/index.js";
+// import { findActiveServerAdapter } from "../adapters/index.js"; // only needed for actualState runtime probe
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { notFound, unprocessable } from "../errors.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
-import { secretService } from "./secrets.js";
+// import { secretService } from "./secrets.js"; // only needed for actualState runtime probe
 
 type CompanySkillRow = typeof companySkills.$inferSelect;
 
@@ -102,6 +102,7 @@ type RuntimeSkillEntryOptions = {
 };
 
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
+const skillInventoryLastRefreshed = new Map<string, number>();
 
 const PROJECT_SCAN_DIRECTORY_ROOTS = [
   "skills",
@@ -472,7 +473,7 @@ function parseFrontmatterMarkdown(raw: string): { frontmatter: Record<string, un
 }
 
 async function fetchText(url: string) {
-  const response = await ghFetch(url);
+  const response = await ghFetch(url, { signal: AbortSignal.timeout(15_000) });
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
@@ -484,6 +485,7 @@ async function fetchJson<T>(url: string): Promise<T> {
     headers: {
       accept: "application/vnd.github+json",
     },
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
@@ -774,13 +776,46 @@ function readInlineSkillImports(companyId: string, files: Record<string, string>
   return imports;
 }
 
-async function walkLocalFiles(root: string, current: string, out: string[]) {
-  const entries = await fs.readdir(current, { withFileTypes: true });
+const WALK_SKIP_DIRS = new Set([
+  ".git",
+  "node_modules",
+  ".pnpm-store",
+  ".cache",
+  ".venv",
+  "__pycache__",
+  "dist",
+  "build",
+  ".next",
+  ".turbo",
+]);
+
+async function walkLocalFiles(
+  root: string,
+  current: string,
+  out: string[],
+  options: { maxDepth?: number; maxFiles?: number; visited?: Set<number> } = {},
+) {
+  const maxDepth = options.maxDepth ?? 10;
+  const maxFiles = options.maxFiles ?? 5000;
+  const visited = options.visited ?? new Set<number>();
+
+  if (maxDepth <= 0 || out.length >= maxFiles) return;
+
+  const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
-    if (entry.name === ".git" || entry.name === "node_modules") continue;
+    if (out.length >= maxFiles) return;
+    if (WALK_SKIP_DIRS.has(entry.name)) continue;
     const absolutePath = path.join(current, entry.name);
     if (entry.isDirectory()) {
-      await walkLocalFiles(root, absolutePath, out);
+      const stat = await fs.stat(absolutePath).catch(() => null);
+      if (!stat) continue;
+      if (visited.has(stat.ino)) continue;
+      visited.add(stat.ino);
+      await walkLocalFiles(root, absolutePath, out, {
+        maxDepth: maxDepth - 1,
+        maxFiles,
+        visited,
+      });
       continue;
     }
     if (!entry.isFile()) continue;
@@ -1457,7 +1492,7 @@ function toCompanySkillListItem(skill: CompanySkill, attachedAgentCount: number)
 export function companySkillService(db: Db) {
   const agents = agentService(db);
   const projects = projectService(db);
-  const secretsSvc = secretService(db);
+  // const secretsSvc = secretService(db); // only needed for actualState runtime probe
 
   async function ensureBundledSkills(companyId: string) {
     for (const skillsRoot of resolveBundledSkillsRoot()) {
@@ -1504,9 +1539,15 @@ export function companySkillService(db: Db) {
   }
 
   async function ensureSkillInventoryCurrent(companyId: string) {
+    const lastTs = skillInventoryLastRefreshed.get(companyId);
+    if (lastTs !== undefined && Date.now() - lastTs < 30_000) {
+      return;
+    }
+
     const existingRefresh = skillInventoryRefreshPromises.get(companyId);
     if (existingRefresh) {
       await existingRefresh;
+      skillInventoryLastRefreshed.set(companyId, Date.now());
       return;
     }
 
@@ -1518,6 +1559,7 @@ export function companySkillService(db: Db) {
     skillInventoryRefreshPromises.set(companyId, refreshPromise);
     try {
       await refreshPromise;
+      skillInventoryLastRefreshed.set(companyId, Date.now());
     } finally {
       if (skillInventoryRefreshPromises.get(companyId) === refreshPromise) {
         skillInventoryRefreshPromises.delete(companyId);
@@ -1573,46 +1615,60 @@ export function companySkillService(db: Db) {
       return desiredSkills.includes(key);
     });
 
-    return Promise.all(
-      desiredAgents.map(async (agent) => {
-        const adapter = findActiveServerAdapter(agent.adapterType);
-        let actualState: string | null = null;
+    // Skip expensive outbound adapter.listSkills() calls for each agent.
+    // The actualState check hits agent runtimes over HTTP and is the main
+    // cause of slow skill detail responses. Return null and let callers
+    // that truly need actualState fetch it on demand.
+    return desiredAgents.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      urlKey: agent.urlKey,
+      adapterType: agent.adapterType,
+      desired: true,
+      actualState: null,
+    }));
 
-        if (!adapter?.listSkills) {
-          actualState = "unsupported";
-        } else {
-          try {
-            const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
-              agent.companyId,
-              agent.adapterConfig as Record<string, unknown>,
-            );
-            const runtimeSkillEntries = await listRuntimeSkillEntries(agent.companyId);
-            const snapshot = await adapter.listSkills({
-              agentId: agent.id,
-              companyId: agent.companyId,
-              adapterType: agent.adapterType,
-              config: {
-                ...runtimeConfig,
-                paperclipRuntimeSkills: runtimeSkillEntries,
-              },
-            });
-            actualState = snapshot.entries.find((entry) => entry.key === key)?.state
-              ?? (snapshot.supported ? "missing" : "unsupported");
-          } catch {
-            actualState = "unknown";
-          }
-        }
-
-        return {
-          id: agent.id,
-          name: agent.name,
-          urlKey: agent.urlKey,
-          adapterType: agent.adapterType,
-          desired: true,
-          actualState,
-        };
-      }),
-    );
+    // Original implementation that probes each agent runtime:
+    // return Promise.all(
+    //   desiredAgents.map(async (agent) => {
+    //     const adapter = findActiveServerAdapter(agent.adapterType);
+    //     let actualState: string | null = null;
+    //
+    //     if (!adapter?.listSkills) {
+    //       actualState = "unsupported";
+    //     } else {
+    //       try {
+    //         const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
+    //           agent.companyId,
+    //           agent.adapterConfig as Record<string, unknown>,
+    //         );
+    //         const runtimeSkillEntries = await listRuntimeSkillEntries(agent.companyId);
+    //         const snapshot = await adapter.listSkills({
+    //           agentId: agent.id,
+    //           companyId: agent.companyId,
+    //           adapterType: agent.adapterType,
+    //           config: {
+    //             ...runtimeConfig,
+    //             paperclipRuntimeSkills: runtimeSkillEntries,
+    //           },
+    //         });
+    //         actualState = snapshot.entries.find((entry) => entry.key === key)?.state
+    //           ?? (snapshot.supported ? "missing" : "unsupported");
+    //       } catch {
+    //         actualState = "unknown";
+    //       }
+    //     }
+    //
+    //     return {
+    //       id: agent.id,
+    //       name: agent.name,
+    //       urlKey: agent.urlKey,
+    //       adapterType: agent.adapterType,
+    //       desired: true,
+    //       actualState,
+    //     };
+    //   }),
+    // );
   }
 
   async function detail(companyId: string, id: string): Promise<CompanySkillDetail | null> {
@@ -2034,16 +2090,36 @@ export function companySkillService(db: Db) {
   async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     const skillDir = path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
+    const markerPath = path.resolve(skillDir, ".materialized");
+    const markerStat = await fs.stat(markerPath).catch(() => null);
+    if (markerStat?.isFile()) {
+      const skillUpdatedAt = skill.updatedAt ? new Date(skill.updatedAt).getTime() : 0;
+      if (markerStat.mtimeMs >= skillUpdatedAt) {
+        return skillDir;
+      }
+    }
+
     await fs.rm(skillDir, { recursive: true, force: true });
     await fs.mkdir(skillDir, { recursive: true });
 
-    for (const entry of skill.fileInventory) {
-      const detail = await readFile(companyId, skill.id, entry.path).catch(() => null);
-      if (!detail) continue;
-      const targetPath = path.resolve(skillDir, entry.path);
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, detail.content, "utf8");
-    }
+    const materializeFiles = async () => {
+      for (const entry of skill.fileInventory) {
+        const detail = await readFile(companyId, skill.id, entry.path).catch(() => null);
+        if (!detail) continue;
+        const targetPath = path.resolve(skillDir, entry.path);
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, detail.content, "utf8");
+      }
+    };
+
+    await Promise.race([
+      materializeFiles(),
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error("Skill materialization timed out")), 30_000),
+      ),
+    ]);
+
+    await fs.writeFile(markerPath, "", "utf8");
 
     return skillDir;
   }
