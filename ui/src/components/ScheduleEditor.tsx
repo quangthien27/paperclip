@@ -41,6 +41,12 @@ const DAYS_OF_MONTH = Array.from({ length: 31 }, (_, i) => ({
   label: String(i + 1),
 }));
 
+// A field is "simple" only if it's a single non-negative number (e.g. "0", "15").
+// Anything else — step values ("*/3"), ranges ("1-5"), lists ("0,30") — is not
+// representable by the preset UI and must fall through to the custom preset so
+// the raw cron expression is preserved verbatim instead of being clobbered.
+const isSimpleNumber = (s: string) => /^\d{1,2}$/.test(s);
+
 function parseCronToPreset(cron: string): {
   preset: SchedulePreset;
   hour: string;
@@ -60,34 +66,36 @@ function parseCronToPreset(cron: string): {
   }
 
   const [min, hr, dom, , dow] = parts;
+  const minIsSimple = min === "*" || isSimpleNumber(min);
+  const hrIsSimple = isSimpleNumber(hr);
 
   // Every minute: "* * * * *"
   if (min === "*" && hr === "*" && dom === "*" && dow === "*") {
     return { preset: "every_minute", ...defaults };
   }
 
-  // Every hour: "0 * * * *"
-  if (hr === "*" && dom === "*" && dow === "*") {
+  // Every hour: "M * * * *"
+  if (hr === "*" && dom === "*" && dow === "*" && minIsSimple) {
     return { preset: "every_hour", ...defaults, minute: min === "*" ? "0" : min };
   }
 
   // Every day: "M H * * *"
-  if (dom === "*" && dow === "*" && hr !== "*") {
+  if (dom === "*" && dow === "*" && hrIsSimple && minIsSimple) {
     return { preset: "every_day", ...defaults, hour: hr, minute: min === "*" ? "0" : min };
   }
 
   // Weekdays: "M H * * 1-5"
-  if (dom === "*" && dow === "1-5" && hr !== "*") {
+  if (dom === "*" && dow === "1-5" && hrIsSimple && minIsSimple) {
     return { preset: "weekdays", ...defaults, hour: hr, minute: min === "*" ? "0" : min };
   }
 
   // Weekly: "M H * * D" (single day)
-  if (dom === "*" && /^\d$/.test(dow) && hr !== "*") {
+  if (dom === "*" && /^\d$/.test(dow) && hrIsSimple && minIsSimple) {
     return { preset: "weekly", ...defaults, hour: hr, minute: min === "*" ? "0" : min, dayOfWeek: dow };
   }
 
   // Monthly: "M H D * *"
-  if (/^\d{1,2}$/.test(dom) && dow === "*" && hr !== "*") {
+  if (/^\d{1,2}$/.test(dom) && dow === "*" && hrIsSimple && minIsSimple) {
     return { preset: "monthly", ...defaults, hour: hr, minute: min === "*" ? "0" : min, dayOfMonth: dom };
   }
 
