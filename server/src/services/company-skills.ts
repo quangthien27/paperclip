@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, asc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySkills } from "@paperclipai/db";
+import { companies, companySkills } from "@paperclipai/db";
 import { readPaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 import type {
@@ -33,7 +33,6 @@ import { notFound, unprocessable } from "../errors.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
-// import { secretService } from "./secrets.js"; // only needed for actualState runtime probe
 
 type CompanySkillRow = typeof companySkills.$inferSelect;
 type CompanySkillListDbRow = Pick<
@@ -71,6 +70,12 @@ type CompanySkillListRow = Pick<
   | "metadata"
   | "createdAt"
   | "updatedAt"
+>;
+type CompanySkillReferenceRow = Pick<
+  CompanySkillRow,
+  | "id"
+  | "key"
+  | "slug"
 >;
 type SkillReferenceTarget = Pick<CompanySkill, "id" | "key" | "slug">;
 type SkillSourceInfoTarget = Pick<
@@ -147,6 +152,27 @@ type RuntimeSkillEntryOptions = {
 
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
 const skillInventoryLastRefreshed = new Map<string, number>();
+
+function selectCompanySkillColumns() {
+  return {
+    id: companySkills.id,
+    companyId: companySkills.companyId,
+    key: companySkills.key,
+    slug: companySkills.slug,
+    name: companySkills.name,
+    description: companySkills.description,
+    markdown: companySkills.markdown,
+    sourceType: companySkills.sourceType,
+    sourceLocator: companySkills.sourceLocator,
+    sourceRef: companySkills.sourceRef,
+    trustLevel: companySkills.trustLevel,
+    compatibility: companySkills.compatibility,
+    fileInventory: companySkills.fileInventory,
+    metadata: companySkills.metadata,
+    createdAt: companySkills.createdAt,
+    updatedAt: companySkills.updatedAt,
+  };
+}
 
 const PROJECT_SCAN_DIRECTORY_ROOTS = [
   "skills",
@@ -1558,7 +1584,6 @@ function toCompanySkillListItem(skill: CompanySkillListRow, attachedAgentCount: 
 export function companySkillService(db: Db) {
   const agents = agentService(db);
   const projects = projectService(db);
-  // const secretsSvc = secretService(db); // only needed for actualState runtime probe
 
   async function ensureBundledSkills(companyId: string) {
     for (const skillsRoot of resolveBundledSkillsRoot()) {
@@ -1588,10 +1613,19 @@ export function companySkillService(db: Db) {
 
   async function pruneMissingLocalPathSkills(companyId: string) {
     const rows = await db
-      .select()
+      .select({
+        id: companySkills.id,
+        key: companySkills.key,
+        slug: companySkills.slug,
+        sourceType: companySkills.sourceType,
+        sourceLocator: companySkills.sourceLocator,
+      })
       .from(companySkills)
       .where(eq(companySkills.companyId, companyId));
-    const skills = rows.map((row) => toCompanySkill(row));
+    const skills = rows.map((row) => ({
+      ...row,
+      sourceType: row.sourceType as CompanySkillSourceType,
+    }));
     const missingIds = new Set(await findMissingLocalSkillIds(skills));
     if (missingIds.size === 0) return;
 
@@ -1618,6 +1652,14 @@ export function companySkillService(db: Db) {
     }
 
     const refreshPromise = (async () => {
+      const companyExists = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows.length > 0);
+      if (!companyExists) {
+        throw notFound("Company not found");
+      }
       await ensureBundledSkills(companyId);
       await pruneMissingLocalPathSkills(companyId);
     })();
@@ -1670,25 +1712,37 @@ export function companySkillService(db: Db) {
   async function listFull(companyId: string): Promise<CompanySkill[]> {
     await ensureSkillInventoryCurrent(companyId);
     const rows = await db
-      .select()
+      .select(selectCompanySkillColumns())
       .from(companySkills)
       .where(eq(companySkills.companyId, companyId))
       .orderBy(asc(companySkills.name), asc(companySkills.key));
     return rows.map((row) => toCompanySkill(row));
   }
 
-  async function getById(id: string) {
-    const row = await db
-      .select()
+  async function listReferenceTargets(companyId: string): Promise<SkillReferenceTarget[]> {
+    const rows = await db
+      .select({
+        id: companySkills.id,
+        key: companySkills.key,
+        slug: companySkills.slug,
+      })
       .from(companySkills)
-      .where(eq(companySkills.id, id))
+      .where(eq(companySkills.companyId, companyId));
+    return rows as CompanySkillReferenceRow[];
+  }
+
+  async function getById(companyId: string, id: string) {
+    const row = await db
+      .select(selectCompanySkillColumns())
+      .from(companySkills)
+      .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, id)))
       .then((rows) => rows[0] ?? null);
     return row ? toCompanySkill(row) : null;
   }
 
   async function getByKey(companyId: string, key: string) {
     const row = await db
-      .select()
+      .select(selectCompanySkillColumns())
       .from(companySkills)
       .where(and(eq(companySkills.companyId, companyId), eq(companySkills.key, key)))
       .then((rows) => rows[0] ?? null);
@@ -1696,81 +1750,36 @@ export function companySkillService(db: Db) {
   }
 
   async function usage(companyId: string, key: string): Promise<CompanySkillUsageAgent[]> {
-    const skills = await listFull(companyId);
+    const skills = await listReferenceTargets(companyId);
     const agentRows = await agents.list(companyId);
     const desiredAgents = agentRows.filter((agent) => {
       const desiredSkills = resolveDesiredSkillKeys(skills, agent.adapterConfig as Record<string, unknown>);
       return desiredSkills.includes(key);
     });
 
-    // Skip expensive outbound adapter.listSkills() calls for each agent.
-    // The actualState check hits agent runtimes over HTTP and is the main
-    // cause of slow skill detail responses. Return null and let callers
-    // that truly need actualState fetch it on demand.
     return desiredAgents.map((agent) => ({
       id: agent.id,
       name: agent.name,
       urlKey: agent.urlKey,
       adapterType: agent.adapterType,
       desired: true,
+      // Runtime adapter state is intentionally omitted from this bounded metadata read.
       actualState: null,
     }));
-
-    // Original implementation that probes each agent runtime:
-    // return Promise.all(
-    //   desiredAgents.map(async (agent) => {
-    //     const adapter = findActiveServerAdapter(agent.adapterType);
-    //     let actualState: string | null = null;
-    //
-    //     if (!adapter?.listSkills) {
-    //       actualState = "unsupported";
-    //     } else {
-    //       try {
-    //         const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
-    //           agent.companyId,
-    //           agent.adapterConfig as Record<string, unknown>,
-    //         );
-    //         const runtimeSkillEntries = await listRuntimeSkillEntries(agent.companyId);
-    //         const snapshot = await adapter.listSkills({
-    //           agentId: agent.id,
-    //           companyId: agent.companyId,
-    //           adapterType: agent.adapterType,
-    //           config: {
-    //             ...runtimeConfig,
-    //             paperclipRuntimeSkills: runtimeSkillEntries,
-    //           },
-    //         });
-    //         actualState = snapshot.entries.find((entry) => entry.key === key)?.state
-    //           ?? (snapshot.supported ? "missing" : "unsupported");
-    //       } catch {
-    //         actualState = "unknown";
-    //       }
-    //     }
-    //
-    //     return {
-    //       id: agent.id,
-    //       name: agent.name,
-    //       urlKey: agent.urlKey,
-    //       adapterType: agent.adapterType,
-    //       desired: true,
-    //       actualState,
-    //     };
-    //   }),
-    // );
   }
 
   async function detail(companyId: string, id: string): Promise<CompanySkillDetail | null> {
     await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(id);
-    if (!skill || skill.companyId !== companyId) return null;
+    const skill = await getById(companyId, id);
+    if (!skill) return null;
     const usedByAgents = await usage(companyId, skill.key);
     return enrichSkill(skill, usedByAgents.length, usedByAgents);
   }
 
   async function updateStatus(companyId: string, skillId: string): Promise<CompanySkillUpdateStatus | null> {
     await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(skillId);
-    if (!skill || skill.companyId !== companyId) return null;
+    const skill = await getById(companyId, skillId);
+    if (!skill) return null;
 
     if (skill.sourceType !== "github" && skill.sourceType !== "skills_sh") {
       return {
@@ -1813,8 +1822,8 @@ export function companySkillService(db: Db) {
 
   async function readFile(companyId: string, skillId: string, relativePath: string): Promise<CompanySkillFileDetail | null> {
     await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(skillId);
-    if (!skill || skill.companyId !== companyId) return null;
+    const skill = await getById(companyId, skillId);
+    if (!skill) return null;
 
     const normalizedPath = normalizePortablePath(relativePath || "SKILL.md");
     const fileEntry = skill.fileInventory.find((entry) => entry.path === normalizedPath);
@@ -1911,8 +1920,8 @@ export function companySkillService(db: Db) {
 
   async function updateFile(companyId: string, skillId: string, relativePath: string, content: string): Promise<CompanySkillFileDetail> {
     await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(skillId);
-    if (!skill || skill.companyId !== companyId) throw notFound("Skill not found");
+    const skill = await getById(companyId, skillId);
+    if (!skill) throw notFound("Skill not found");
 
     const source = deriveSkillSourceInfo(skill);
     if (!source.editable || skill.sourceType !== "local_path") {
@@ -1951,8 +1960,8 @@ export function companySkillService(db: Db) {
 
   async function installUpdate(companyId: string, skillId: string): Promise<CompanySkill | null> {
     await ensureSkillInventoryCurrent(companyId);
-    const skill = await getById(skillId);
-    if (!skill || skill.companyId !== companyId) return null;
+    const skill = await getById(companyId, skillId);
+    if (!skill) return null;
 
     const status = await updateStatus(companyId, skillId);
     if (!status?.supported) {
@@ -2212,7 +2221,7 @@ export function companySkillService(db: Db) {
     return skillDir;
   }
 
-  function resolveRuntimeSkillMaterializedPath(companyId: string, skill: CompanySkill) {
+  function resolveRuntimeSkillMaterializedPath(companyId: string, skill: Pick<CompanySkill, "key" | "slug">) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     return path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
   }
